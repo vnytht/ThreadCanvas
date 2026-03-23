@@ -369,3 +369,40 @@ export const generateInitialTitle = async (
 
      return "Conversation Start";
 }
+
+export const synthesizeContextFromNodes = async (
+    nodeBlocks: Array<{
+        title: string;
+        messages: Array<{ role: string; content: string }>;
+    }>,
+    preferredBackend: 'GEMINI' | 'OLLAMA'
+): Promise<string> => {
+    const fragments = nodeBlocks.map((block, i) => {
+        const lines = block.messages
+            .slice(-6)
+            .map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.content.slice(0, 500)}`)
+            .join('\n');
+        return `Fragment ${i + 1} (from thread "${block.title}"):\n${lines}`;
+    }).join('\n\n---\n\n');
+
+    const prompt = `You are a context compression engine for a non-linear AI conversation tool. The user has selected the following conversation fragments from different parts of their conversation history. Your job is to synthesize these into a single, dense, coherent context summary that preserves all key information, decisions, constraints, and intent signals. Write in second person ("You are working on...", "The key decisions so far are..."). Be specific — include actual names, numbers, technical details from the fragments. Do not add commentary. Do not say "here is a summary". Just write the synthesized context directly. Maximum 400 words.
+
+SELECTED FRAGMENTS:
+
+${fragments}`;
+
+    const tryGemini = async () => executeGeminiAnalysis(prompt);
+    const tryOllama = async () => callOllamaAnalysis(prompt);
+
+    const strategies = preferredBackend === 'OLLAMA'
+        ? [tryOllama, tryGemini]
+        : [tryGemini, tryOllama];
+
+    for (const strategy of strategies) {
+        const result = await strategy();
+        if (result) return result.trim();
+    }
+
+    // Fallback: simple concatenation summary
+    return `Combined context from threads: ${nodeBlocks.map(b => `"${b.title}"`).join(', ')}. Continue building on the insights and decisions from these conversations.`;
+}

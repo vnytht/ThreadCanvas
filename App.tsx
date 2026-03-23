@@ -1,15 +1,18 @@
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { Send, Paperclip, Share, Plus, Sparkles, ArrowUp, Clock, ChevronDown, Waypoints } from 'lucide-react';
+import { Send, Paperclip, Share, Plus, Sparkles, ArrowUp, Clock, ChevronDown, Waypoints, Backpack } from 'lucide-react';
 import { motion, AnimatePresence, useMotionValue, useTransform, animate } from 'framer-motion';
 import { INITIAL_MESSAGES, ROOT_MESSAGE } from './constants';
-import { Message, Author, MessageCategory, Chapter } from './types';
+import { Message, Author, MessageCategory, Chapter, ContextItem } from './types';
 import { Sidebar } from './components/Sidebar';
 import { MessageBubble } from './components/MessageBubble';
 import { Button } from './components/Button';
 import { CanvasView } from './components/CanvasView';
-import { streamResponse, analyzeTopicShift, generateInitialTitle, BackendType, AVAILABLE_GEMINI_MODELS } from './services/gemini';
+import { ContextPanel } from './components/ContextPanel';
+import { ContextComposer } from './components/ContextComposer';
+import { streamResponse, analyzeTopicShift, generateInitialTitle, synthesizeContextFromNodes, BackendType, AVAILABLE_GEMINI_MODELS } from './services/gemini';
 import { OllamaGuide } from './components/OllamaGuide';
+import { groupMessages, GroupedNode } from './utils/canvasLayout';
 
 const App = () => {
   // --- Core State ---
@@ -37,6 +40,17 @@ const App = () => {
   const [isDraftingBranch, setIsDraftingBranch] = useState(false);
   const [swipeDirection, setSwipeDirection] = useState<'left' | 'right'>('right');
   const [isExtendedThinking, setIsExtendedThinking] = useState(false);
+
+  // --- Context Backpack State ---
+  const [pinnedItems, setPinnedItems] = useState<ContextItem[]>([]);
+  const [isContextPanelOpen, setIsContextPanelOpen] = useState(false);
+
+  // --- Selective Context Composer State ---
+  const [selectedCanvasNodeIds, setSelectedCanvasNodeIds] = useState<Set<string>>(new Set());
+  const [isComposerOpen, setIsComposerOpen] = useState(false);
+  const [composerSynthesisText, setComposerSynthesisText] = useState('');
+  const [isSynthesizing, setIsSynthesizing] = useState(false);
+  const [composerError, setComposerError] = useState<string | undefined>();
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -511,7 +525,173 @@ const App = () => {
      setActiveBranchHeadId(ROOT_MESSAGE.id);
      setShowCanvasTip(false);
      setIsDraftingBranch(false);
+     setPinnedItems([]);
+     setSelectedCanvasNodeIds(new Set());
+     setIsComposerOpen(false);
+     setComposerSynthesisText('');
+     setComposerError(undefined);
   }
+
+  const handlePinItem = (messageId: string, content: string) => {
+     const newItem: ContextItem = {
+         id: `pin-${Date.now()}`,
+         content,
+         sourceMessageId: messageId,
+         addedAt: Date.now()
+     };
+     setPinnedItems(prev => [...prev, newItem]);
+  };
+
+  const handleUnpinItem = (itemId: string) => {
+     setPinnedItems(prev => prev.filter(i => i.id !== itemId));
+  };
+
+  // --- Selective Context Composer Handlers ---
+
+  const handleCanvasNodeSelect = useCallback((nodeId: string, selected: boolean) => {
+      setSelectedCanvasNodeIds(prev => {
+          const next = new Set(prev);
+          if (selected) next.add(nodeId);
+          else next.delete(nodeId);
+          return next;
+      });
+  }, []);
+
+  const handleOpenComposer = useCallback(() => {
+      setIsComposerOpen(true);
+      setComposerSynthesisText('');
+      setComposerError(undefined);
+  }, []);
+
+  const handleSynthesizeContext = useCallback(async () => {
+      if (selectedCanvasNodeIds.size < 2) return;
+      setIsSynthesizing(true);
+      setComposerError(undefined);
+      try {
+          const allGroups = groupMessages(messages, chapters);
+          const nodeBlocks = Array.from(selectedCanvasNodeIds).map(nodeId => {
+              const group = allGroups.find(g => g.id === nodeId);
+              if (!group) return null;
+              return {
+                  title: group.title,
+                  messages: group.messages
+                      .filter(m => m.content !== 'SYSTEM_ROOT')
+                      .map(m => ({
+                          role: m.author === Author.USER ? 'user' : 'model',
+                          content: m.content
+                      }))
+              };
+          }).filter(Boolean) as Array<{ title: string; messages: Array<{ role: string; content: string }> }>;
+
+          const synthesis = await synthesizeContextFromNodes(nodeBlocks, preferredBackend);
+          setComposerSynthesisText(synthesis);
+      } catch (err) {
+          setComposerError('Synthesis failed. Please try again.');
+      } finally {
+          setIsSynthesizing(false);
+      }
+  }, [selectedCanvasNodeIds, messages, chapters, preferredBackend]);
+
+  const handleBranchFromComposed = useCallback(async () => {
+      if (!composerSynthesisText.trim() || isStreaming) return;
+
+      const composedText = composerSynthesisText;
+      const nodeIds = Array.from(selectedCanvasNodeIds);
+
+      // Close composer and clear selection
+      setIsComposerOpen(false);
+      setSelectedCanvasNodeIds(new Set());
+      setComposerSynthesisText('');
+      setComposerError(undefined);
+
+      // Switch to chat view immediately
+      setViewMode('LINEAR');
+      setIsStreaming(true);
+      setIsDraftingBranch(false);
+
+      // Create new message parented to ROOT — a fresh branch with composed context
+      const newMsgId = `composed-${Date.now()}`;
+      const newMessage: Message = {
+          id: newMsgId,
+          parentId: ROOT_MESSAGE.id,
+          author: Author.USER,
+          content: composedText,
+          timestamp: Date.now(),
+          category: MessageCategory.CONTEXT,
+          branchId: `b-composed-${Date.now()}`,
+          isComposedContext: true,
+          composedFromNodeIds: nodeIds
+      };
+
+      // Create a chapter for this composed branch
+      const branchChapterId = `chap-composed-${Date.now()}`;
+      const shortTitle = composedText.slice(0, 30).trim() + '...';
+      const composedChapter: Chapter = {
+          id: branchChapterId,
+          title: shortTitle,
+          category: MessageCategory.CONTEXT,
+          startMessageId: newMsgId,
+          messageCount: 0,
+          subtopics: []
+      };
+      setChapters(prev => [...prev, composedChapter]);
+
+      // Generate a better AI title async
+      generateInitialTitle([{ role: 'user', content: composedText }], preferredBackend).then(aiTitle => {
+          if (aiTitle) {
+              setChapters(prev => prev.map(c =>
+                  c.id === branchChapterId ? { ...c, title: `[Composed] ${aiTitle}` } : c
+              ));
+          }
+      });
+
+      setMessages(prev => [...prev, newMessage]);
+      setActiveBranchHeadId(newMsgId);
+      lastAnalyzedIndexRef.current = 0;
+
+      // Create response placeholder
+      const responseId = `resp-composed-${Date.now()}`;
+      const responsePlaceholder: Message = {
+          id: responseId,
+          parentId: newMsgId,
+          author: Author.ASSISTANT,
+          content: '',
+          timestamp: Date.now() + 1
+      };
+      setMessages(prev => [...prev, responsePlaceholder]);
+      setActiveBranchHeadId(responseId);
+
+      // Animate container in from canvas
+      containerScale.set(0.6);
+      animate(containerScale, 1, { duration: 0.4, ease: [0.2, 0.8, 0.2, 1] });
+
+      let fullResponse = '';
+      await streamResponse(
+          [{ role: 'user', content: composedText }],
+          (chunk) => {
+              fullResponse += chunk;
+              setMessages(prev => prev.map(m =>
+                  m.id === responseId ? { ...m, content: fullResponse } : m
+              ));
+          },
+          (type) => setBackendType(type),
+          preferredBackend,
+          selectedModelId
+      );
+      setIsStreaming(false);
+
+      setTimeout(() => {
+          const el = document.getElementById(`msg-bubble-${newMsgId}`);
+          el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }, 200);
+  }, [composerSynthesisText, selectedCanvasNodeIds, isStreaming, preferredBackend, selectedModelId]);
+
+  // Computed: selected nodes as GroupedNode array for the Composer panel
+  const selectedComposerNodes = useMemo((): GroupedNode[] => {
+      if (selectedCanvasNodeIds.size === 0) return [];
+      const allGroups = groupMessages(messages, chapters);
+      return allGroups.filter(g => selectedCanvasNodeIds.has(g.id));
+  }, [selectedCanvasNodeIds, messages, chapters]);
 
   const renderInputArea = (centered: boolean) => (
       <div 
@@ -601,6 +781,15 @@ const App = () => {
                         <button onClick={() => setViewMode('CANVAS')} className={`px-4 py-1.5 rounded-md text-xs font-lexend font-medium transition-all ${viewMode === 'CANVAS' ? 'bg-white shadow-sm text-gray-800' : 'text-gray-500 hover:text-gray-700'}`}>Canvas</button>
                     </div>
                     <button onClick={handleResetChat} className="p-2 text-gray-400 hover:text-gray-600 rounded-lg hover:bg-black/5" title="Start New Chat"><Plus size={16} /></button>
+                    {viewMode === 'LINEAR' && (
+                        <button
+                            onClick={() => setIsContextPanelOpen(p => !p)}
+                            className={`p-2 rounded-lg hover:bg-black/5 transition-colors ${isContextPanelOpen ? 'text-blue-500' : 'text-gray-400 hover:text-gray-600'}`}
+                            title="Context Backpack"
+                        >
+                            <Backpack size={16} />
+                        </button>
+                    )}
                     <Button variant="secondary" className="text-xs h-8"><Share size={14} /> Share</Button>
                 </div>
             </header>
@@ -641,10 +830,11 @@ const App = () => {
                     <div className="max-w-4xl mx-auto pb-[240px] flex flex-col gap-[32px]"> 
                         {currentThread.map((msg, idx) => (
                             <div key={msg.id} id={`msg-bubble-${msg.id}`} data-message-id={msg.id}>
-                                <MessageBubble 
-                                    message={msg as any} 
+                                <MessageBubble
+                                    message={msg as any}
                                     onBranch={handleBranch}
                                     onSwipeBranch={handleSwipeBranch}
+                                    onPin={handlePinItem}
                                     isHead={idx === currentThread.length - 1}
                                     parentContent={messages.find(m => m.id === msg.parentId)?.content}
                                     slideDirection={swipeDirection}
@@ -669,18 +859,53 @@ const App = () => {
             )}
             </motion.div>
         ) : (
-            <CanvasView 
+            <CanvasView
                 key="canvas-view"
-                messages={messages} 
+                messages={messages}
                 chapters={chapters}
                 activeBranchHeadId={activeBranchHeadId}
                 onNavigate={handleNavigate}
                 entryAnimation={true}
                 onUpdateNodeTitle={handleUpdateNodeTitle}
+                selectedNodeIds={selectedCanvasNodeIds}
+                onNodeSelectionChange={handleCanvasNodeSelect}
+                onOpenComposer={handleOpenComposer}
+                onClearSelection={() => setSelectedCanvasNodeIds(new Set())}
             />
         )}
         </AnimatePresence>
       </div>
+      {/* Context Backpack Panel — slides in on the right side of the chat view */}
+      <AnimatePresence>
+        {isContextPanelOpen && viewMode === 'LINEAR' && !isNewChat && (
+          <motion.div
+            initial={{ x: '100%', opacity: 0 }}
+            animate={{ x: 0, opacity: 1 }}
+            exit={{ x: '100%', opacity: 0 }}
+            transition={{ type: 'spring', stiffness: 400, damping: 40 }}
+          >
+            <ContextPanel pinnedItems={pinnedItems} onUnpin={handleUnpinItem} />
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Selective Context Composer — overlays on canvas view */}
+      <AnimatePresence>
+        {isComposerOpen && (
+          <ContextComposer
+            selectedNodes={selectedComposerNodes}
+            onClose={() => setIsComposerOpen(false)}
+            onRemoveNode={(nodeId) => handleCanvasNodeSelect(nodeId, false)}
+            synthesisText={composerSynthesisText}
+            onSynthesisTextChange={setComposerSynthesisText}
+            isSynthesizing={isSynthesizing}
+            onSynthesize={handleSynthesizeContext}
+            onBranchFromComposed={handleBranchFromComposed}
+            error={composerError}
+            onRetry={handleSynthesizeContext}
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
 };

@@ -1,8 +1,21 @@
 
 import React, { useMemo, useState, useRef, useEffect, memo, Dispatch, SetStateAction } from 'react';
 import { Message, Author, Chapter } from '../types';
-import { Clock, Layers, ZoomIn, ZoomOut, Maximize, GitCommit, FileText, ChevronRight, Edit2, MessageSquare, Code, List } from 'lucide-react';
-import { motion, useMotionValue, animate, MotionValue, useTransform, PanInfo } from 'framer-motion';
+import { ZoomIn, ZoomOut, Maximize, Edit2, MessageSquare, Code, List, Sparkles, X } from 'lucide-react';
+import { motion, useMotionValue, animate, MotionValue, useTransform, PanInfo, AnimatePresence } from 'framer-motion';
+import {
+    GroupedNode,
+    NodePosition,
+    groupMessages,
+    calculateGroupLayout,
+    getNodeStyles,
+    getRelativeTime,
+    GROUP_WIDTH,
+    GROUP_HEIGHT,
+    CANVAS_SIZE,
+    CANVAS_CENTER,
+    GRID_SIZE
+} from '../utils/canvasLayout';
 
 interface CanvasViewProps {
   messages: Message[];
@@ -11,252 +24,12 @@ interface CanvasViewProps {
   onNavigate: (msgId: string) => void;
   entryAnimation?: boolean;
   onUpdateNodeTitle?: (startMessageId: string, newTitle: string) => void;
+  // Multi-select / Composer props
+  selectedNodeIds: Set<string>;
+  onNodeSelectionChange: (nodeId: string, selected: boolean) => void;
+  onOpenComposer: () => void;
+  onClearSelection: () => void;
 }
-
-// --- Types ---
-
-interface NodePosition {
-    x: number;
-    y: number;
-}
-
-interface GroupedNode {
-  id: string; // The ID of the LAST message in the group
-  startMessageId: string;
-  messages: Message[];
-  childrenIds: string[]; // IDs of the first messages of child groups
-  x: number;
-  y: number;
-  depth: number;
-  title: string;
-  preview: string;
-  hasCode: boolean;
-  hasList: boolean;
-  language?: string;
-  timestamp: number;
-  internalChapters: Chapter[]; // Chapters contained within this node
-  isRoot: boolean;
-}
-
-// --- Constants ---
-const GROUP_WIDTH = 280;
-const GROUP_HEIGHT = 160;
-const X_SPACING = 340;
-const Y_SPACING = 190;
-const CANVAS_SIZE = 50000;
-const CANVAS_CENTER = CANVAS_SIZE / 2;
-const GRID_SIZE = 25; 
-
-// --- Helper Functions ---
-
-const getNodeStyles = (isRoot: boolean, isActive: boolean) => {
-    if (isRoot) {
-        return { 
-            outerBg: '#F0F6FF',
-            outerBorder: '#61A6FB',
-            innerBg: '#F0F6FF'
-        }; 
-    }
-    if (isActive) {
-        return { 
-            outerBg: '#ECFEF6',
-            outerBorder: '#34D399',
-            innerBg: '#ECFEF6'
-        };
-    }
-    return { 
-        outerBg: '#FBFCFD',
-        outerBorder: '#DCDFEA',
-        innerBg: '#FBFCFD'
-    };
-};
-
-const getRelativeTime = (timestamp: number) => {
-    const diff = Date.now() - timestamp;
-    if (diff < 60000) return 'Just now';
-    const mins = Math.floor(diff / 60000);
-    if (mins < 60) return `${mins}m ago`;
-    const hours = Math.floor(mins / 60);
-    if (hours < 24) return `${hours}h ago`;
-    return `${Math.floor(hours / 24)}d ago`;
-};
-
-const cleanTextPreview = (text: string) => {
-    return text
-        .replace(/^Sure, I can help.*/i, '')
-        .replace(/^Here is the.*/i, '')
-        .replace(/^Certainly!.*/i, '')
-        .replace(/^I'd be happy to.*/i, '')
-        .replace(/\*\*/g, '')
-        .replace(/^SYSTEM_ROOT$/i, '')
-        .trim();
-};
-
-const extractCodeSnippet = (text: string): { lang: string, snippet: string } | null => {
-    const match = text.match(/```(\w+)?\n([\s\S]*?)```/);
-    if (match) {
-        const lang = match[1] || 'Code';
-        const lines = match[2].split('\n').filter(l => l.trim().length > 0).slice(0, 3);
-        return { lang, snippet: lines.join('\n') };
-    }
-    return null;
-};
-
-const extractListPreview = (text: string): string | null => {
-    const listItems = text.match(/^[-*•] .+$|^\d+\. .+$/gm);
-    if (listItems && listItems.length > 0) {
-        return listItems.slice(0, 2).join('\n'); 
-    }
-    return null;
-}
-
-const groupMessages = (allMessages: Message[], chapters: Chapter[]): GroupedNode[] => {
-    if (allMessages.length === 0) return [];
-    const childrenMap = new Map<string, string[]>();
-    const messageMap = new Map<string, Message>();
-    let rootId: string | null = null;
-    allMessages.forEach(m => {
-        messageMap.set(m.id, m);
-        if (m.parentId) {
-            if (!childrenMap.has(m.parentId)) childrenMap.set(m.parentId, []);
-            childrenMap.get(m.parentId)?.push(m.id);
-        } else {
-            rootId = m.id;
-        }
-    });
-    if (!rootId) return [];
-    const groups: GroupedNode[] = [];
-    const visitedMsgIds = new Set<string>(); 
-    const buildGroup = (startMsgId: string, depth: number): string | null => {
-        if (visitedMsgIds.has(startMsgId)) return null; 
-        const currentGroupMessages: Message[] = [];
-        let currId: string | null = startMsgId;
-        while (currId) {
-            if (visitedMsgIds.has(currId)) break; 
-            const msg = messageMap.get(currId);
-            if (!msg) break;
-            visitedMsgIds.add(currId);
-            currentGroupMessages.push(msg);
-            const children = childrenMap.get(currId) || [];
-            if (children.length === 1) {
-                currId = children[0];
-            } else {
-                currId = null;
-            }
-        }
-        if (currentGroupMessages.length === 0) return null;
-        const tailMsg = currentGroupMessages[currentGroupMessages.length - 1];
-        const isRootNode = currentGroupMessages[0].id === rootId;
-        const firstUserMsg = currentGroupMessages.find(m => m.author === Author.USER);
-        const lastAiMsg = [...currentGroupMessages].reverse().find(m => m.author === Author.ASSISTANT);
-        const groupMessageIds = new Set(currentGroupMessages.map(m => m.id));
-        const internalChapters = chapters.filter(c => groupMessageIds.has(c.startMessageId));
-        const mainChapter = internalChapters.length > 0 ? internalChapters[internalChapters.length - 1] : null;
-        
-        let title = "";
-        // PRIORITIZE AI CHAPTER TITLE OVER HARDCODED "START"
-        if (mainChapter) {
-            title = mainChapter.title;
-        } else if (isRootNode) {
-            title = "Thread Start";
-        } else {
-            if (firstUserMsg) {
-                const raw = firstUserMsg.content;
-                title = raw.slice(0, 35) + (raw.length > 35 ? '...' : '');
-            } else {
-                title = "Untitled Node";
-            }
-        }
-
-        const aiContent = lastAiMsg ? lastAiMsg.content : "System";
-        const hasCode = aiContent.includes('```');
-        const hasList = /^(- |\d+\. )/m.test(aiContent);
-        let preview = "";
-        let language = undefined;
-
-        // IMPROVED ROOT PREVIEW: Grab first real message instead of "Conversation Start"
-        if (isRootNode) {
-            const firstRealMsg = currentGroupMessages.find(m => m.content !== 'SYSTEM_ROOT');
-            if (firstRealMsg) {
-                preview = cleanTextPreview(firstRealMsg.content).slice(0, 100) + (firstRealMsg.content.length > 100 ? '...' : '');
-            } else {
-                preview = "Thread Start";
-            }
-        } else if (hasCode) {
-            const codeData = extractCodeSnippet(aiContent);
-            if (codeData) { preview = codeData.snippet; language = codeData.lang; }
-            else preview = cleanTextPreview(aiContent).slice(0, 70);
-        } else if (hasList) {
-            const listData = extractListPreview(aiContent);
-            if (listData) preview = listData;
-            else preview = cleanTextPreview(aiContent).slice(0, 70);
-        } else {
-            preview = cleanTextPreview(aiContent).slice(0, 80) + (aiContent.length > 80 ? '...' : '');
-        }
-
-        const node: GroupedNode = {
-            id: tailMsg.id, 
-            startMessageId: startMsgId,
-            messages: currentGroupMessages,
-            childrenIds: [], 
-            x: depth * X_SPACING + 50,
-            y: 0, 
-            depth: depth,
-            title,
-            preview,
-            hasCode,
-            hasList,
-            language,
-            timestamp: tailMsg.timestamp,
-            internalChapters: internalChapters,
-            isRoot: isRootNode
-        };
-        groups.push(node);
-        const tailChildren = childrenMap.get(tailMsg.id) || [];
-        tailChildren.forEach(childId => {
-            const childGroupId = buildGroup(childId, depth + 1);
-            if (childGroupId) node.childrenIds.push(childGroupId);
-        });
-        return node.id;
-    };
-    buildGroup(rootId, 0);
-    return groups;
-};
-
-const calculateGroupLayout = (groups: GroupedNode[]) => {
-    if (groups.length === 0) return [];
-    const groupMap = new Map<string, GroupedNode>();
-    groups.forEach(g => groupMap.set(g.id, g));
-    const getGroupChildren = (g: GroupedNode) => g.childrenIds.map(id => groupMap.get(id)).filter(Boolean) as GroupedNode[];
-    const processedNodes = new Set<string>();
-    const assignY = (node: GroupedNode, startY: number): number => {
-        if (processedNodes.has(node.id)) return 1; 
-        processedNodes.add(node.id);
-        const children = getGroupChildren(node);
-        if (children.length === 0) {
-            node.y = startY;
-            return 1; 
-        }
-        let currentY = startY;
-        let totalHeight = 0;
-        children.forEach(child => {
-            const childHeight = assignY(child, currentY);
-            currentY += childHeight * Y_SPACING;
-            totalHeight += childHeight;
-        });
-        const firstChildY = children[0].y;
-        const lastChildY = children[children.length - 1].y;
-        node.y = (firstChildY + lastChildY) / 2;
-        return totalHeight;
-    };
-    const roots = groups.filter(g => g.depth === 0);
-    let currentRootY = 100;
-    roots.forEach(root => {
-        const height = assignY(root, currentRootY);
-        currentRootY += height * Y_SPACING;
-    });
-    return groups;
-};
 
 // --- Minimap Component ---
 
@@ -305,7 +78,7 @@ const Minimap = memo(({ nodes, activeId, x, y, scale }: MinimapProps) => {
             <motion.div style={{ x: miniX, y: miniY, scale: miniScale, originX: 0.5, originY: 0.5 }} className="absolute top-0 left-0 w-full h-full">
                 {nodes.map(node => {
                     const isActive = node.id === activeId || node.messages.some(m => m.id === activeId);
-                    const bgClass = node.isRoot ? 'bg-blue-400' : (isActive ? 'bg-emerald-400' : 'bg-gray-300');
+                    const bgClass = node.isRoot ? 'bg-blue-400' : (node.isComposedContext ? 'bg-violet-400' : (isActive ? 'bg-emerald-400' : 'bg-gray-300'));
                     return (
                         <div key={node.id} className={`absolute rounded-[2px] ${bgClass}`} style={{ left: node.x - bounds.minX - bounds.w/2, top: node.y - bounds.minY - bounds.h/2, width: GROUP_WIDTH, height: GROUP_HEIGHT }} />
                     );
@@ -321,23 +94,25 @@ interface CanvasNodeProps {
     node: GroupedNode;
     isActive: boolean;
     isHead: boolean;
+    isSelected: boolean;
     setNodeOverrides: Dispatch<SetStateAction<Record<string, NodePosition>>>;
     onNavigate: (id: string) => void;
+    onSelect: (nodeId: string) => void;
     setDraggingNodeId: (id: string | null) => void;
     isDragging: boolean;
     onUpdateNodeTitle?: (startMessageId: string, newTitle: string) => void;
     scale: MotionValue<number>;
 }
 
-const CanvasNode = memo(({ node, isActive, isHead, setNodeOverrides, onNavigate, setDraggingNodeId, isDragging, onUpdateNodeTitle, scale }: CanvasNodeProps) => {
+const CanvasNode = memo(({ node, isActive, isHead, isSelected, setNodeOverrides, onNavigate, onSelect, setDraggingNodeId, isDragging, onUpdateNodeTitle, scale }: CanvasNodeProps) => {
     const [isEditing, setIsEditing] = useState(false);
     const [editTitle, setEditTitle] = useState(node.title);
 
-    const styles = getNodeStyles(node.isRoot, isActive);
-    
+    const styles = getNodeStyles(node.isRoot, isActive, node.isComposedContext);
+
     // Accurate visible message count (excluding system messages)
     const visibleMessageCount = node.messages.filter(m => m.content !== 'SYSTEM_ROOT').length;
-    
+
     // Content type icon logic
     const ContentTypeIcon = node.hasCode ? Code : (node.hasList ? List : MessageSquare);
 
@@ -355,10 +130,10 @@ const CanvasNode = memo(({ node, isActive, isHead, setNodeOverrides, onNavigate,
     return (
         <motion.div
             className={`absolute w-[280px] h-[160px] cursor-grab active:cursor-grabbing pointer-events-auto transition-opacity duration-300 opacity-100`}
-            style={{ 
-                x: CANVAS_CENTER + node.x, 
-                y: CANVAS_CENTER + node.y, 
-                zIndex: isDragging ? 50 : (isActive ? 20 : 10) 
+            style={{
+                x: CANVAS_CENTER + node.x,
+                y: CANVAS_CENTER + node.y,
+                zIndex: isDragging ? 50 : (isSelected ? 30 : (isActive ? 20 : 10))
             }}
             drag dragMomentum={false} dragElastic={0}
             onDrag={(e, info: PanInfo) => {
@@ -367,19 +142,23 @@ const CanvasNode = memo(({ node, isActive, isHead, setNodeOverrides, onNavigate,
                     const currentPos = prev[node.id] ?? { x: node.x, y: node.y };
                     const rawX = currentPos.x + (info.delta.x / currentScale);
                     const rawY = currentPos.y + (info.delta.y / currentScale);
-                    
-                    // Fixed jitter: update state but allow Framer Motion to handle visual smoothness
                     const snappedX = Math.round(rawX / GRID_SIZE) * GRID_SIZE;
                     const snappedY = Math.round(rawY / GRID_SIZE) * GRID_SIZE;
-                    
                     return { ...prev, [node.id]: { x: snappedX, y: snappedY } };
                 });
             }}
             onDragStart={() => setDraggingNodeId(node.id)}
             onDragEnd={() => setDraggingNodeId(null)}
-            onTap={(e, info) => {
+            onTap={(e) => {
+                const nativeEvent = e as unknown as MouseEvent;
                 const target = e.target as HTMLElement;
-                if (!target.closest('button') && !target.closest('.timeline-item') && !target.closest('input')) {
+                if (target.closest('button') || target.closest('.timeline-item') || target.closest('input')) return;
+
+                if (nativeEvent.shiftKey) {
+                    // Shift+click = toggle selection for Composer
+                    onSelect(node.id);
+                } else {
+                    // Normal click = navigate to this thread
                     let targetId = node.startMessageId;
                     if (node.messages[0].content === 'SYSTEM_ROOT' && node.messages.length > 1) {
                         targetId = node.messages[1].id;
@@ -389,19 +168,24 @@ const CanvasNode = memo(({ node, isActive, isHead, setNodeOverrides, onNavigate,
             }}
             whileDrag={{ scale: 1.05, boxShadow: "0px 10px 20px rgba(0,0,0,0.15)" }}
         >
-            <div 
-                className="w-full h-full rounded-[9px] flex flex-col p-[3px] font-lexend transition-all duration-200"
-                style={{ 
-                    background: styles.outerBg, 
-                    outline: `1px ${styles.outerBorder} solid`,
-                    outlineOffset: '-1px'
+            <div
+                className="w-full h-full rounded-[9px] flex flex-col p-[3px] font-lexend transition-all duration-200 relative"
+                style={{
+                    background: styles.outerBg,
+                    outline: `${isSelected ? '2px' : '1px'} ${styles.outerBorder} ${styles.borderStyle}`,
+                    outlineOffset: isSelected ? '2px' : '-1px'
                 }}
             >
+                {/* Selection ring overlay */}
+                {isSelected && (
+                    <div className="absolute inset-0 rounded-[9px] ring-2 ring-violet-500 ring-offset-1 pointer-events-none z-30" />
+                )}
+
                 {/* Header Section */}
                 <div className="w-full flex flex-col rounded-t-[6px]" style={{ background: styles.innerBg }}>
                     <div className="w-full px-3 py-2 flex items-center justify-between">
                         {isEditing ? (
-                            <input 
+                            <input
                                 value={editTitle}
                                 onChange={(e) => setEditTitle(e.target.value)}
                                 onBlur={handleSaveTitle}
@@ -416,7 +200,7 @@ const CanvasNode = memo(({ node, isActive, isHead, setNodeOverrides, onNavigate,
                                     {node.title}
                                 </span>
                                 {onUpdateNodeTitle && (
-                                    <button 
+                                    <button
                                         onClick={(e) => { e.stopPropagation(); setIsEditing(true); }}
                                         className="opacity-0 group-hover/title:opacity-100 text-gray-400 hover:text-blue-500 transition-opacity"
                                     >
@@ -426,13 +210,18 @@ const CanvasNode = memo(({ node, isActive, isHead, setNodeOverrides, onNavigate,
                             </div>
                         )}
                         <div className="flex items-center gap-1.5 flex-shrink-0">
+                            {node.isComposedContext && (
+                                <span title="Composed Context">
+                                    <Sparkles size={12} className="text-violet-400" />
+                                </span>
+                            )}
                             <ContentTypeIcon size={14} className="text-[#A5ABB6] opacity-60" />
                         </div>
                     </div>
                 </div>
 
                 {/* Inner Card */}
-                <div 
+                <div
                     className="flex-1 px-3 pt-3 pb-2 bg-white rounded-[6px] flex flex-col justify-start gap-2.5 overflow-hidden"
                     style={{ outline: '1px #DCDFEA solid', outlineOffset: '-1px' }}
                 >
@@ -471,6 +260,7 @@ const CanvasNode = memo(({ node, isActive, isHead, setNodeOverrides, onNavigate,
         prev.node.y === next.node.y &&
         prev.isActive === next.isActive &&
         prev.isHead === next.isHead &&
+        prev.isSelected === next.isSelected &&
         prev.isDragging === next.isDragging &&
         prev.node.id === next.node.id &&
         prev.node.title === next.node.title &&
@@ -481,16 +271,48 @@ const CanvasNode = memo(({ node, isActive, isHead, setNodeOverrides, onNavigate,
 
 // --- Main Component ---
 
-export const CanvasView: React.FC<CanvasViewProps> = ({ messages, chapters, activeBranchHeadId, onNavigate, entryAnimation = false, onUpdateNodeTitle }) => {
+export const CanvasView: React.FC<CanvasViewProps> = ({
+    messages,
+    chapters,
+    activeBranchHeadId,
+    onNavigate,
+    entryAnimation = false,
+    onUpdateNodeTitle,
+    selectedNodeIds,
+    onNodeSelectionChange,
+    onOpenComposer,
+    onClearSelection
+}) => {
   const [nodeOverrides, setNodeOverrides] = useState<Record<string, NodePosition>>(() => {
       const saved = localStorage.getItem('threadcanvas_node_overrides');
       return saved ? JSON.parse(saved) : {};
   });
   const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
+  const [showHint, setShowHint] = useState(false);
 
   useEffect(() => {
       localStorage.setItem('threadcanvas_node_overrides', JSON.stringify(nodeOverrides));
   }, [nodeOverrides]);
+
+  // Show hint after 3s if user hasn't used the composer yet
+  useEffect(() => {
+      const hintShown = localStorage.getItem('threadcanvas_composer_hint_shown');
+      if (hintShown) return;
+      const timer = setTimeout(() => setShowHint(true), 3000);
+      const hideTimer = setTimeout(() => setShowHint(false), 11000);
+      return () => { clearTimeout(timer); clearTimeout(hideTimer); };
+  }, []);
+
+  // Escape key clears selection
+  useEffect(() => {
+      const handleKeyDown = (e: KeyboardEvent) => {
+          if (e.key === 'Escape' && selectedNodeIds.size > 0) {
+              onClearSelection();
+          }
+      };
+      window.addEventListener('keydown', handleKeyDown);
+      return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedNodeIds.size, onClearSelection]);
 
   const defaultLayoutNodes = useMemo(() => {
       const groups = groupMessages(messages, chapters);
@@ -532,7 +354,7 @@ export const CanvasView: React.FC<CanvasViewProps> = ({ messages, chapters, acti
       if (e.ctrlKey) {
           e.preventDefault();
           const currentScale = scale.get();
-          const d = e.deltaY * -0.01; 
+          const d = e.deltaY * -0.01;
           const newScale = Math.min(Math.max(0.25, currentScale + d), 4);
           scale.set(newScale);
       } else {
@@ -571,6 +393,16 @@ export const CanvasView: React.FC<CanvasViewProps> = ({ messages, chapters, acti
 
   const activeNodeId = nodes.find(n => n.messages.some(m => m.id === activeBranchHeadId))?.id || activeBranchHeadId;
 
+  const handleNodeSelect = (nodeId: string) => {
+      // Mark hint as shown once user starts selecting
+      localStorage.setItem('threadcanvas_composer_hint_shown', 'true');
+      setShowHint(false);
+      const isCurrentlySelected = selectedNodeIds.has(nodeId);
+      // Max 8 nodes
+      if (!isCurrentlySelected && selectedNodeIds.size >= 8) return;
+      onNodeSelectionChange(nodeId, !isCurrentlySelected);
+  };
+
   // FIXED DOT GRID LOGIC
   const gridX = useTransform(x, val => `${val}px`);
   const gridY = useTransform(y, val => `${val}px`);
@@ -578,44 +410,43 @@ export const CanvasView: React.FC<CanvasViewProps> = ({ messages, chapters, acti
   return (
     <div ref={viewportRef} className="flex-1 overflow-hidden bg-[#FBFBFB] relative select-none h-full w-full">
        {/* Background Grid - Dots stay same size regardless of zoom */}
-       <motion.div 
-         className="absolute inset-0 pointer-events-none z-0" 
-         style={{ 
+       <motion.div
+         className="absolute inset-0 pointer-events-none z-0"
+         style={{
             backgroundPositionX: gridX,
             backgroundPositionY: gridY,
-            backgroundImage: 'radial-gradient(#E5E7EB 1.5px, transparent 1.5px)', 
+            backgroundImage: 'radial-gradient(#E5E7EB 1.5px, transparent 1.5px)',
             backgroundSize: `${GRID_SIZE}px ${GRID_SIZE}px`,
             opacity: 0.6
-         }} 
+         }}
        />
-       
-       <motion.div 
-         className="absolute top-1/2 left-1/2 cursor-grab active:cursor-grabbing z-10" 
-         style={{ 
-            x, y, scale, 
-            width: CANVAS_SIZE, 
-            height: CANVAS_SIZE, 
-            marginLeft: -CANVAS_CENTER, 
-            marginTop: -CANVAS_CENTER, 
-            originX: 0.5, originY: 0.5 
-         }} 
-         drag 
-         dragMomentum={false} 
-         dragElastic={0} 
-         onWheel={handleWheel} 
+
+       <motion.div
+         className="absolute top-1/2 left-1/2 cursor-grab active:cursor-grabbing z-10"
+         style={{
+            x, y, scale,
+            width: CANVAS_SIZE,
+            height: CANVAS_SIZE,
+            marginLeft: -CANVAS_CENTER,
+            marginTop: -CANVAS_CENTER,
+            originX: 0.5, originY: 0.5
+         }}
+         drag
+         dragMomentum={false}
+         dragElastic={0}
+         onWheel={handleWheel}
        >
             <svg className="absolute inset-0 w-full h-full overflow-visible pointer-events-none z-0">
                 {edges.map((edge, idx) => {
                     const dx = edge.targetX - edge.sourceX;
-                    const dy = edge.targetY - edge.sourceY;
-                    const curveOffset = Math.max(40, Math.min(100, dx * 0.4)); 
+                    const curveOffset = Math.max(40, Math.min(100, dx * 0.4));
                     return (
-                        <path 
-                            key={`edge-${idx}`} 
-                            d={`M ${CANVAS_CENTER + edge.sourceX} ${CANVAS_CENTER + edge.sourceY} C ${CANVAS_CENTER + edge.sourceX + curveOffset} ${CANVAS_CENTER + edge.sourceY}, ${CANVAS_CENTER + edge.targetX - curveOffset} ${CANVAS_CENTER + edge.targetY}, ${CANVAS_CENTER + edge.targetX} ${CANVAS_CENTER + edge.targetY}`} 
-                            fill="none" 
-                            stroke={"#D1D5DB"} 
-                            strokeWidth={2} 
+                        <path
+                            key={`edge-${idx}`}
+                            d={`M ${CANVAS_CENTER + edge.sourceX} ${CANVAS_CENTER + edge.sourceY} C ${CANVAS_CENTER + edge.sourceX + curveOffset} ${CANVAS_CENTER + edge.sourceY}, ${CANVAS_CENTER + edge.targetX - curveOffset} ${CANVAS_CENTER + edge.targetY}, ${CANVAS_CENTER + edge.targetX} ${CANVAS_CENTER + edge.targetY}`}
+                            fill="none"
+                            stroke={"#D1D5DB"}
+                            strokeWidth={2}
                         />
                     );
                 })}
@@ -624,16 +455,19 @@ export const CanvasView: React.FC<CanvasViewProps> = ({ messages, chapters, acti
                 {nodes.map((node) => {
                     const isActive = node.messages.some(m => m.id === activeBranchHeadId);
                     const isHead = node.id === activeBranchHeadId || node.messages.some(m => m.id === activeBranchHeadId);
+                    const isSelected = selectedNodeIds.has(node.id);
                     return (
-                        <CanvasNode 
-                            key={node.id} 
-                            node={node} 
-                            isActive={isActive} 
-                            isHead={isHead} 
-                            setNodeOverrides={setNodeOverrides} 
-                            onNavigate={onNavigate} 
-                            setDraggingNodeId={setDraggingNodeId} 
-                            isDragging={draggingNodeId === node.id} 
+                        <CanvasNode
+                            key={node.id}
+                            node={node}
+                            isActive={isActive}
+                            isHead={isHead}
+                            isSelected={isSelected}
+                            setNodeOverrides={setNodeOverrides}
+                            onNavigate={onNavigate}
+                            onSelect={handleNodeSelect}
+                            setDraggingNodeId={setDraggingNodeId}
+                            isDragging={draggingNodeId === node.id}
                             onUpdateNodeTitle={onUpdateNodeTitle}
                             scale={scale}
                         />
@@ -642,6 +476,7 @@ export const CanvasView: React.FC<CanvasViewProps> = ({ messages, chapters, acti
             </div>
        </motion.div>
 
+      {/* Zoom Controls */}
       <div className="absolute bottom-6 left-6 z-50 flex flex-col gap-3 pointer-events-auto">
          <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-1 flex items-center self-start">
             <button onClick={handleZoomOut} className="p-2 hover:bg-gray-50 rounded-md text-gray-500 transition-colors"><ZoomOut size={16}/></button>
@@ -650,11 +485,63 @@ export const CanvasView: React.FC<CanvasViewProps> = ({ messages, chapters, acti
             <div className="w-[1px] h-4 bg-gray-100 mx-1"></div>
             <button onClick={handleZoomIn} className="p-2 hover:bg-gray-50 rounded-md text-gray-500 transition-colors"><ZoomIn size={16}/></button>
          </div>
-     </div>
+      </div>
 
-     <div className="absolute bottom-6 right-6 z-50">
-        <Minimap nodes={nodes} activeId={activeNodeId} x={x} y={y} scale={scale} />
-     </div>
+      {/* Minimap */}
+      <div className="absolute bottom-6 right-6 z-50">
+         <Minimap nodes={nodes} activeId={activeNodeId} x={x} y={y} scale={scale} />
+      </div>
+
+      {/* Hint text — appears after 3s, disappears after 8s, never shows again once composer used */}
+      <AnimatePresence>
+          {showHint && selectedNodeIds.size === 0 && nodes.length > 1 && (
+              <motion.div
+                  className="absolute bottom-[88px] left-1/2 -translate-x-1/2 z-40 pointer-events-none"
+                  initial={{ opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: 6 }}
+                  transition={{ duration: 0.6 }}
+              >
+                  <span className="text-[11px] text-gray-400 font-lexend bg-white/90 backdrop-blur-sm px-3 py-1.5 rounded-full border border-gray-100 shadow-sm">
+                      Hold Shift + click nodes to compose context across branches
+                  </span>
+              </motion.div>
+          )}
+      </AnimatePresence>
+
+      {/* Floating selection action bar */}
+      <AnimatePresence>
+          {selectedNodeIds.size > 0 && (
+              <motion.div
+                  className="absolute bottom-[88px] left-1/2 -translate-x-1/2 z-50 pointer-events-auto"
+                  initial={{ y: 16, opacity: 0, scale: 0.96 }}
+                  animate={{ y: 0, opacity: 1, scale: 1 }}
+                  exit={{ y: 16, opacity: 0, scale: 0.96 }}
+                  transition={{ type: 'spring', stiffness: 500, damping: 40 }}
+              >
+                  <div className="bg-white border border-violet-200 shadow-xl rounded-2xl px-4 py-2.5 flex items-center gap-3">
+                      <span className="text-xs text-gray-500 font-lexend">
+                          <span className="font-semibold text-violet-600">{selectedNodeIds.size}</span> node{selectedNodeIds.size > 1 ? 's' : ''} selected
+                      </span>
+                      <div className="w-[1px] h-4 bg-gray-200" />
+                      <button
+                          onClick={onOpenComposer}
+                          className="flex items-center gap-1.5 bg-violet-600 hover:bg-violet-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors shadow-sm"
+                      >
+                          <Sparkles size={13} />
+                          Compose Context
+                      </button>
+                      <button
+                          onClick={onClearSelection}
+                          className="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
+                          title="Clear selection (Esc)"
+                      >
+                          <X size={14} />
+                      </button>
+                  </div>
+              </motion.div>
+          )}
+      </AnimatePresence>
     </div>
   );
 };

@@ -33,6 +33,8 @@ export interface Message {
   siblingCount?: number; // For Carousel UI
   prevSibling?: Message;
   nextSibling?: Message;
+  isComposedContext?: boolean; // True if created by the Selective Context Composer
+  composedFromNodeIds?: string[]; // Canvas node IDs that were selected for synthesis
 }
 
 export interface Branch {

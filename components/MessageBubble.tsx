@@ -1,25 +1,27 @@
 
 import React from 'react';
 import { Author, Message } from '../types';
-import { GitBranch, Copy, ChevronLeft, ChevronRight, ThumbsUp, ThumbsDown, RotateCw, Edit2, CornerDownRight } from 'lucide-react';
+import { GitBranch, Copy, ChevronLeft, ChevronRight, ThumbsUp, ThumbsDown, RotateCw, Edit2, CornerDownRight, Pin } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 
 interface MessageBubbleProps {
   message: Message;
   onBranch: (messageId: string) => void;
   onSwipeBranch?: (messageId: string, direction: 'prev' | 'next') => void;
+  onPin?: (messageId: string, content: string) => void;
   isHead?: boolean;
   parentContent?: string;
-  slideDirection?: 'left' | 'right'; 
+  slideDirection?: 'left' | 'right';
   prevSibling?: Message;
   nextSibling?: Message;
 }
 
-export const MessageBubble: React.FC<MessageBubbleProps> = ({ 
-    message, 
-    onBranch, 
-    onSwipeBranch, 
-    isHead, 
+export const MessageBubble: React.FC<MessageBubbleProps> = ({
+    message,
+    onBranch,
+    onSwipeBranch,
+    onPin,
+    isHead,
     parentContent,
     slideDirection = 'right'
 }) => {
@@ -159,7 +161,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                     <div className="h-3 w-[1px] bg-gray-300 mx-2"></div>
 
                     {/* Branch Button */}
-                    <button 
+                    <button
                         onClick={() => onBranch(message.id)}
                         className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-500 hover:text-claude-accent hover:bg-claude-accent/10 rounded transition-colors group/branch"
                         title="Fork conversation from here"
@@ -167,6 +169,18 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                         <GitBranch size={15} className="group-hover/branch:rotate-90 transition-transform duration-300"/>
                         <span>Branch</span>
                     </button>
+
+                    {/* Pin Button */}
+                    {onPin && (
+                        <button
+                            onClick={() => onPin(message.id, message.content)}
+                            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-500 hover:text-blue-500 hover:bg-blue-50 rounded transition-colors"
+                            title="Pin to Context Backpack"
+                        >
+                            <Pin size={14} />
+                            <span>Pin</span>
+                        </button>
+                    )}
                 </div>
             </div>
         </div>
