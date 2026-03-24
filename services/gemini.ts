@@ -293,49 +293,112 @@ export const streamResponse = async (
 
 // --- TITLE VALIDATION ---
 // Rejects model outputs that are sentences instead of titles (common failure mode on smaller models)
-const SENTENCE_STARTERS = ['since ', 'the user', 'based on', 'it ', 'this ', 'when ', 'as the', 'given ', 'because ', 'therefore ', 'after ', 'following ', 'note:', 'output:', 'title:'];
+const SENTENCE_STARTERS = ['since ', 'the user', 'based on', 'it ', 'this ', 'when ', 'as the', 'given ', 'because ', 'therefore ', 'after ', 'following ', 'note:', 'output:', 'title:', 'a new ', 'here ', 'okay', 'sure', 'i '];
+const GENERIC_TITLES = new Set(['new topic', 'topic change', 'different subject', 'new subject', 'general discussion', 'untitled', 'conversation', 'language query', 'new chapter', 'topic shift', 'subject change']);
 
 const validateAndCleanTitle = (raw: string): string | null => {
-    const clean = raw.trim().replace(/^"|"$/g, '').replace(/\.$/, '').trim();
+    let clean = raw.trim().replace(/^"|"$/g, '').replace(/\.$/, '').trim();
     if (!clean) return null;
     if (clean.toLowerCase() === 'same') return 'SAME';
+
+    // If model wrapped in meta-commentary like "A new chapter! Output: Real Title", extract after colon
+    if (clean.includes(':')) {
+        const afterColon = clean.split(':').slice(1).join(':').trim();
+        if (afterColon && afterColon.split(/\s+/).length <= 6) {
+            clean = afterColon;
+        }
+    }
+
+    // Strip trailing " Topic" — common model failure (e.g. "Language Query Topic" → "Language Query")
+    clean = clean.replace(/\s+topic$/i, '').trim();
+    if (!clean) return null;
+
+    // Reject anything with exclamation marks or asterisks — it's commentary, not a title
+    if (clean.includes('!') || clean.includes('*')) return null;
+
     const words = clean.split(/\s+/);
     if (words.length > 8) return null; // it's a sentence, not a title
     const lower = clean.toLowerCase();
     if (SENTENCE_STARTERS.some(s => lower.startsWith(s))) return null;
+    if (GENERIC_TITLES.has(lower)) return null; // reject placeholder → caller falls back
     return clean;
 };
 
-export const analyzeTopicShift = async (
-    currentTopic: string | null,
-    newMessages: { role: string; content: string }[],
-    preferredBackend: 'GEMINI' | 'OLLAMA' = 'GEMINI'
-): Promise<string> => {
+// --- LAYER 2: HEURISTIC PRE-FILTER ---
+const REPLACEMENT_SIGNALS = ['actually', 'instead', 'switch to', 'change to', 'scratch that', 'forget that', 'never mind', 'on second thought', 'rather than', 'let\'s do', 'how about we do'];
+const CONTINUATION_SIGNALS = ['also', 'and what about', 'what if', 'how about for', 'another thing', 'one more', 'additionally', 'plus', 'regarding', 'about the', 'for the', 'back to', 'what about'];
 
-    if (!currentTopic) {
-        return generateInitialTitle(newMessages, preferredBackend);
+type HeuristicHint = 'LIKELY_NEW' | 'LIKELY_SAME' | 'UNCERTAIN';
+
+const getHeuristicHint = (currentTopic: string, userMessage: string): HeuristicHint => {
+    const msgLower = userMessage.toLowerCase();
+
+    // Check replacement signals — "actually" + context suggests a change of mind
+    if (REPLACEMENT_SIGNALS.some(signal => msgLower.includes(signal))) {
+        return 'LIKELY_NEW';
     }
 
-    const lastUserMessage = newMessages.filter(m => m.role === 'user').pop()?.content || "";
-    const lastModelMessage = newMessages.filter(m => m.role === 'model').pop()?.content || "";
+    // Check continuation signals
+    if (CONTINUATION_SIGNALS.some(signal => msgLower.startsWith(signal) || msgLower.includes(signal))) {
+        return 'LIKELY_SAME';
+    }
 
-    const prompt = `You are a topic classifier for a conversation UI. Decide if the conversation topic has changed.
+    // Keyword divergence: does the message share ANY content words with the topic?
+    const topicWords = new Set(
+        currentTopic.toLowerCase().split(/\s+/).filter(w => w.length > 3)
+    );
+    const msgWords = msgLower.split(/\s+/).filter(w => w.length > 3);
+    const hasOverlap = msgWords.some(w => topicWords.has(w));
 
-Current Topic: "${currentTopic}"
-Last User Message: "${lastUserMessage.slice(0, 300)}"
-Last AI Response: "${lastModelMessage.slice(0, 200)}"
+    const isQuestion = msgLower.includes('?') || /^(what|who|how|where|when|why|can|do|does|is|are)\b/.test(msgLower);
 
-Rules:
-- Return SAME if the user is refining, selecting an option, asking a follow-up, or staying on the same subject.
-- Return a SHORT TITLE (2-5 words, Title Case) if the user starts a clearly new task, changes domain, or switches subject entirely.
+    // Zero overlap + question + enough words → likely a different domain
+    if (!hasOverlap && isQuestion && msgWords.length >= 2) {
+        return 'LIKELY_NEW';
+    }
 
-STRICT OUTPUT FORMAT:
-- Unchanged topic → respond with exactly: SAME
-- New topic → respond with 2-5 words in Title Case, nothing else
-- DO NOT write sentences, explanations, or reasoning of any kind
-- DO NOT start your response with: Since, The, Based, It, This, When, Given, As, After, Note, Output
-- CORRECT examples: Birthday Party Ideas | Wedding Venue | Code Review | Budget Analysis | Travel Planning
-- WRONG examples: Since the user mentioned... | The topic has shifted... | Based on the message...`;
+    return 'UNCERTAIN';
+};
+
+// --- LAYER 3, STEP 1: BINARY CLASSIFICATION ---
+const parseClassification = (raw: string): 'SAME' | 'NEW' | null => {
+    const clean = raw.trim().toUpperCase();
+    if (clean === 'SAME' || clean === 'NEW') return clean;
+    if (clean.startsWith('SAME')) return 'SAME';
+    if (clean.startsWith('NEW')) return 'NEW';
+    // Short response — check for either word
+    if (clean.length < 30) {
+        if (clean.includes('NEW')) return 'NEW';
+        if (clean.includes('SAME')) return 'SAME';
+    }
+    return null;
+};
+
+const classifyTopicShift = async (
+    currentTopic: string,
+    lastUserMessage: string,
+    hint: HeuristicHint,
+    preferredBackend: 'GEMINI' | 'OLLAMA'
+): Promise<'SAME' | 'NEW'> => {
+    const hintLine = hint === 'LIKELY_NEW' ? '\nHint: this message likely starts a new topic.\n'
+        : hint === 'LIKELY_SAME' ? '\nHint: this message likely continues the current topic.\n'
+        : '';
+
+    const prompt = `Classify: does this message continue the current topic, or start a new one? Reply with ONLY the word SAME or NEW.
+${hintLine}
+Examples:
+- Topic: "Dinner Party Planning", Message: "what food should we serve?" → SAME
+- Topic: "Dinner Party Planning", Message: "what about outdoor seating?" → SAME
+- Topic: "Dinner Party Planning", Message: "what if guests are vegan?" → SAME
+- Topic: "Dinner Party Planning", Message: "what music should I play?" → SAME
+- Topic: "Dinner Party Planning", Message: "actually, let's do Japanese instead" → NEW
+- Topic: "Dinner Party Planning", Message: "what's the capital of India?" → NEW
+- Topic: "Python Debugging", Message: "can you fix the loop too?" → SAME
+- Topic: "Python Debugging", Message: "help me plan my vacation" → NEW
+- Topic: "Italian Recipes", Message: "actually switch to French cooking" → NEW
+- Topic: "Travel Planning", Message: "what about hotels?" → SAME
+
+Topic: "${currentTopic}", Message: "${lastUserMessage.slice(0, 200)}" →`;
 
     const tryGemini = async () => executeGeminiAnalysis(prompt);
     const tryOllama = async () => callOllamaAnalysis(prompt);
@@ -347,15 +410,83 @@ STRICT OUTPUT FORMAT:
     for (const strategy of strategies) {
         const result = await strategy();
         if (result) {
-            const validated = validateAndCleanTitle(result);
-            if (!validated) continue; // bad format — try next backend
-            if (validated === 'SAME') return 'SAME';
-            if (validated.toLowerCase() === currentTopic.toLowerCase()) return 'SAME';
-            return validated;
+            const parsed = parseClassification(result);
+            if (parsed) {
+                console.log(`[Topic] classify "${lastUserMessage.slice(0, 40)}..." vs "${currentTopic}" → ${parsed} (hint: ${hint}, raw: "${result.trim()}")`);
+                return parsed;
+            }
         }
     }
 
-    return "SAME";
+    console.log(`[Topic] classify fallback → SAME (all backends failed)`);
+    return 'SAME';
+};
+
+// --- LAYER 3, STEP 2: TITLE GENERATION ---
+const generateTopicTitle = async (
+    lastUserMessage: string,
+    lastModelMessage: string,
+    preferredBackend: 'GEMINI' | 'OLLAMA'
+): Promise<string> => {
+    const prompt = `Write a 2-4 word Title Case name for this conversation topic. Output ONLY the title, nothing else.
+
+User said: "${lastUserMessage.slice(0, 300)}"
+AI responded: "${lastModelMessage.slice(0, 200)}"
+
+Title:`;
+
+    const tryGemini = async () => executeGeminiAnalysis(prompt);
+    const tryOllama = async () => callOllamaAnalysis(prompt);
+
+    const strategies = preferredBackend === 'OLLAMA'
+        ? [tryOllama, tryGemini]
+        : [tryGemini, tryOllama];
+
+    for (const strategy of strategies) {
+        const result = await strategy();
+        if (result) {
+            // Strip "NEW:" prefix if classification leaked into title
+            let cleaned = result.replace(/^NEW[:\s]+/i, '').trim();
+            const validated = validateAndCleanTitle(cleaned);
+            if (validated && validated !== 'SAME') {
+                console.log(`[Topic] title generated: "${validated}"`);
+                return validated;
+            }
+        }
+    }
+
+    // Last resort: extract key words from the user message
+    const words = lastUserMessage.split(/\s+/).filter(w => w.length > 3).slice(0, 3);
+    const fallback = words.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+    console.log(`[Topic] title fallback: "${fallback || 'New Discussion'}"`);
+    return fallback || 'New Discussion';
+};
+
+// --- ORCHESTRATOR (same signature as before) ---
+export const analyzeTopicShift = async (
+    currentTopic: string | null,
+    newMessages: { role: string; content: string }[],
+    preferredBackend: 'GEMINI' | 'OLLAMA' = 'GEMINI'
+): Promise<string> => {
+    // No current topic → generate initial title (first message in thread)
+    if (!currentTopic) {
+        return generateInitialTitle(newMessages, preferredBackend);
+    }
+
+    const lastUserMessage = newMessages.filter(m => m.role === 'user').pop()?.content || "";
+    const lastModelMessage = newMessages.filter(m => m.role === 'model').pop()?.content || "";
+
+    if (!lastUserMessage) return 'SAME';
+
+    // Layer 2: Heuristic pre-filter
+    const hint = getHeuristicHint(currentTopic, lastUserMessage);
+
+    // Layer 3, Step 1: Binary classification (SAME or NEW)
+    const classification = await classifyTopicShift(currentTopic, lastUserMessage, hint, preferredBackend);
+    if (classification === 'SAME') return 'SAME';
+
+    // Layer 3, Step 2: Generate title (only when NEW)
+    return await generateTopicTitle(lastUserMessage, lastModelMessage, preferredBackend);
 };
 
 export const generateInitialTitle = async (
@@ -363,8 +494,10 @@ export const generateInitialTitle = async (
     preferredBackend: 'GEMINI' | 'OLLAMA'
 ): Promise<string> => {
     const text = messages.map(m => m.content).join('\n').slice(0, 500);
-    const prompt = `Generate a 2-4 word title for this conversation, suitable for a table of contents. Title Case only. No quotes, no punctuation, no sentences, no explanations — just the title words.
-Examples of correct output: Birthday Party Ideas | Wedding Planning | Code Review | Marketing Strategy
+    const prompt = `2-4 word title for this conversation. Title Case. Nothing else — no quotes, no punctuation, no explanation, no preamble.
+FORBIDDEN: "New Topic", "Topic Change", titles ending in "Topic", any sentence or commentary.
+GOOD: Dinner Party Planning | Japanese Theme Ideas | Capital of India | Wine Recommendations
+BAD: New Topic | Language Query Topic | A new chapter! Output: ...
 Text: ${text}`;
 
     const tryGemini = async () => await executeGeminiAnalysis(prompt);

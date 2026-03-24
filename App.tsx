@@ -182,29 +182,33 @@ const App = () => {
               // 4-word gate: short messages can't signal a topic shift — skip API call
               const lastUserMsg = bufferMessages.filter(m => m.author === Author.USER).pop();
               const wordCount = lastUserMsg?.content.trim().split(/\s+/).length ?? 0;
-              if (wordCount > 0 && wordCount < 4 && currentChapter !== undefined) {
-                  setChapters(prev => {
-                      let lastThreadChapIndex = -1;
-                      const updatedChapters = [...prev];
-                      for (let i = updatedChapters.length - 1; i >= 0; i--) {
-                          if (threadIds.has(updatedChapters[i].startMessageId)) {
-                              lastThreadChapIndex = i;
-                              break;
+              if (wordCount > 0 && wordCount < 4) {
+                  if (currentChapter !== undefined) {
+                      // Extend existing chapter — don't create a new one for a short message
+                      setChapters(prev => {
+                          let lastThreadChapIndex = -1;
+                          const updatedChapters = [...prev];
+                          for (let i = updatedChapters.length - 1; i >= 0; i--) {
+                              if (threadIds.has(updatedChapters[i].startMessageId)) {
+                                  lastThreadChapIndex = i;
+                                  break;
+                              }
                           }
-                      }
-                      if (lastThreadChapIndex !== -1) {
-                          const lastChap = updatedChapters[lastThreadChapIndex];
-                          updatedChapters[lastThreadChapIndex] = {
-                              ...lastChap,
-                              messageCount: lastChap.messageCount + newMessagesCount,
-                              subtopics: Array.from(new Set([...lastChap.subtopics, ...extractSubtopics(bufferMessages)])).slice(0, 12),
-                              confidence: lastChap.confidence === 'user-edited' ? 'user-edited' : 'auto-confirmed'
-                          };
-                          return updatedChapters;
-                      }
-                      return prev;
-                  });
-                  lastAnalyzedIndexRef.current = totalCount;
+                          if (lastThreadChapIndex !== -1) {
+                              const lastChap = updatedChapters[lastThreadChapIndex];
+                              updatedChapters[lastThreadChapIndex] = {
+                                  ...lastChap,
+                                  messageCount: lastChap.messageCount + newMessagesCount,
+                                  subtopics: Array.from(new Set([...lastChap.subtopics, ...extractSubtopics(bufferMessages)])).slice(0, 12),
+                                  confidence: lastChap.confidence === 'user-edited' ? 'user-edited' : 'auto-confirmed'
+                              };
+                              return updatedChapters;
+                          }
+                          return prev;
+                      });
+                      lastAnalyzedIndexRef.current = totalCount;
+                  }
+                  // No currentChapter + short message: hold ref, wait for more context next turn
                   return;
               }
 
@@ -399,7 +403,11 @@ const App = () => {
         };
         setChapters(prev => [...prev, newBranchChapter]);
 
-        generateInitialTitle([{ role: 'user', content }], preferredBackend).then(aiTitle => {
+        const parentMsg = messages.find(m => m.id === activeBranchHeadId);
+        const titleContext = parentMsg
+            ? [{ role: 'model', content: parentMsg.content.slice(0, 300) }, { role: 'user', content }]
+            : [{ role: 'user', content }];
+        generateInitialTitle(titleContext, preferredBackend).then(aiTitle => {
             if (aiTitle) {
                 setChapters(prev => prev.map(c => c.id === branchChapterId ? { ...c, title: aiTitle } : c));
             }
