@@ -148,11 +148,13 @@ const streamOllamaResponse = async (history: { role: string; content: string }[]
     }
 };
 
-const callOllamaAnalysis = async (prompt: string): Promise<string | null> => {
+const callOllamaAnalysis = async (prompt: string, timeoutMs = 3000): Promise<string | null> => {
     try {
         const modelName = await getOllamaModel();
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 3000); // 3s timeout — fail fast on Vercel
+        // Short timeout (3s) for topic classification — fast fail on Vercel so Gemini takes over
+        // Long timeout (30s) for synthesis — needs time to read full messages and write summary
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
         const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -773,7 +775,8 @@ SELECTED FRAGMENTS:
 ${fragments}`;
 
     const tryGemini = async () => executeGeminiAnalysis(prompt);
-    const tryOllama = async () => callOllamaAnalysis(prompt);
+    // Synthesis needs 30s — it reads full messages and writes a 400-word summary
+    const tryOllama = async () => callOllamaAnalysis(prompt, 30000);
 
     const strategies = preferredBackend === 'OLLAMA'
         ? [tryOllama, tryGemini]
