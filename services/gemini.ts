@@ -429,6 +429,9 @@ const generateTopicTitle = async (
     preferredBackend: 'GEMINI' | 'OLLAMA'
 ): Promise<string> => {
     const prompt = `Write a 2-4 word Title Case name for this conversation topic. Output ONLY the title, nothing else.
+Keep it simple and descriptive — NOT poetic, creative, or metaphorical.
+GOOD: Japanese Dinner Theme | Italian Food Planning | Capital of India | Vegan Menu Options
+BAD: Sakura Soiree | Culinary Journey | Eastern Delights
 
 User said: "${lastUserMessage.slice(0, 300)}"
 AI responded: "${lastModelMessage.slice(0, 200)}"
@@ -488,6 +491,230 @@ export const analyzeTopicShift = async (
     // Layer 3, Step 2: Generate title (only when NEW)
     return await generateTopicTitle(lastUserMessage, lastModelMessage, preferredBackend);
 };
+
+// =============================================================================
+// CURVETILE — Multi-Signal Topic Detection Module (Stage 1: standalone/testable)
+// Signals: NCD (compression) + Jaccard (lexical) + SemanticCurvature (Ollama embed)
+// NOT yet wired into analyzeTopicShift — test from browser console first:
+//   await window.__curveTile.computeNCD("let's plan a dinner party, Italian food", "what music should I play?")
+//   window.__curveTile.computeJaccard(["let's plan a dinner party", "Italian food is great"], "what music?")
+//   await window.__curveTile.multiSignalVote(["let's plan a dinner", "italian food"], "what music?")
+// =============================================================================
+
+type SignalVote = 'SAME' | 'NEW' | 'UNCERTAIN';
+
+// --- STOPWORDS for Jaccard ---
+const STOPWORDS = new Set([
+    'a','an','the','and','or','but','in','on','at','to','for','of','with',
+    'as','by','from','is','it','its','was','are','be','been','being','have',
+    'has','had','do','does','did','will','would','could','should','may','might',
+    'this','that','these','those','i','you','he','she','we','they','what',
+    'who','how','why','when','where','which','can','just','also','not','so',
+    'if','then','than','more','some','any','all','each','very','much','many'
+]);
+
+// --- SIGNAL A: Normalized Compression Distance via browser gzip ---
+// NCD(x,y) = [C(xy) - min(C(x),C(y))] / max(C(x),C(y))
+// Values: 0.0 = identical, 1.0 = unrelated
+// SAME < 0.30 | UNCERTAIN 0.30-0.60 | NEW > 0.60
+export const computeNCD = async (contextText: string, newMessage: string): Promise<SignalVote> => {
+    try {
+        const compress = async (text: string): Promise<number> => {
+            const encoder = new TextEncoder();
+            const data = encoder.encode(text);
+            const cs = new CompressionStream('gzip');
+            const writer = cs.writable.getWriter();
+            writer.write(data);
+            writer.close();
+            const reader = cs.readable.getReader();
+            let size = 0;
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                size += value.length;
+            }
+            return size;
+        };
+
+        const cx = await compress(contextText.slice(0, 600));
+        const cy = await compress(newMessage.slice(0, 300));
+        const cxy = await compress((contextText + ' ' + newMessage).slice(0, 900));
+
+        const ncd = (cxy - Math.min(cx, cy)) / Math.max(cx, cy);
+        // Raised NEW threshold to 0.72 — gzip overhead inflates NCD for short texts
+        // SAME < 0.35 | UNCERTAIN 0.35-0.72 | NEW > 0.72
+        const vote: SignalVote = ncd < 0.35 ? 'SAME' : ncd > 0.72 ? 'NEW' : 'UNCERTAIN';
+        console.log(`[CurveTile] NCD: cx=${cx} cy=${cy} cxy=${cxy} → ncd=${ncd.toFixed(3)} → ${vote}`);
+        return vote;
+    } catch (e) {
+        console.warn('[CurveTile] NCD unavailable (CompressionStream not supported):', e);
+        return 'UNCERTAIN';
+    }
+};
+
+// --- SIGNAL B: Keyword Jaccard Overlap ---
+// Confirms SAME when keywords overlap — does NOT vote NEW (low overlap ≠ new topic,
+// it just means a follow-up question about a different aspect of the same task)
+// SAME > 0.08 | UNCERTAIN otherwise
+export const computeJaccard = (contextMessages: string[], newMessage: string): SignalVote => {
+    const extractWords = (text: string): Set<string> => {
+        const words = text.toLowerCase()
+            .replace(/[^a-z0-9\s]/g, ' ')
+            .split(/\s+/)
+            .filter(w => w.length > 3 && !STOPWORDS.has(w));
+        return new Set(words);
+    };
+
+    const contextWords = new Set<string>();
+    contextMessages.forEach(msg => extractWords(msg).forEach(w => contextWords.add(w)));
+    const newWords = extractWords(newMessage);
+
+    if (newWords.size === 0 || contextWords.size === 0) return 'UNCERTAIN';
+
+    const intersection = new Set([...newWords].filter(w => contextWords.has(w)));
+    const union = new Set([...contextWords, ...newWords]);
+    const jaccard = intersection.size / union.size;
+
+    // Only confirms SAME — never votes NEW (low overlap is expected for sub-topic questions)
+    const vote: SignalVote = jaccard > 0.08 ? 'SAME' : 'UNCERTAIN';
+    console.log(`[CurveTile] Jaccard: intersection=${intersection.size} union=${union.size} → j=${jaccard.toFixed(3)} → ${vote}`);
+    return vote;
+};
+
+// --- SIGNAL C: Semantic Curvature via Ollama embeddings (optional, graceful fallback) ---
+const embeddingCache = new Map<string, number[]>();
+
+export const callOllamaEmbed = async (text: string): Promise<number[] | null> => {
+    const key = text.slice(0, 100);
+    if (embeddingCache.has(key)) return embeddingCache.get(key)!;
+    try {
+        const modelName = await getOllamaModel();
+        const response = await fetch(`${OLLAMA_BASE_URL}/api/embed`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: modelName, input: text })
+        });
+        if (!response.ok) return null;
+        const json = await response.json();
+        const embedding = json.embeddings?.[0] || json.embedding || null;
+        if (embedding) embeddingCache.set(key, embedding);
+        return embedding;
+    } catch {
+        return null;
+    }
+};
+
+const dotProduct = (a: number[], b: number[]): number =>
+    a.reduce((sum, val, i) => sum + val * b[i], 0);
+
+const magnitude = (v: number[]): number =>
+    Math.sqrt(v.reduce((sum, val) => sum + val * val, 0));
+
+const cosineSim = (a: number[], b: number[]): number => {
+    const mag = magnitude(a) * magnitude(b);
+    return mag === 0 ? 0 : dotProduct(a, b) / mag;
+};
+
+// Returns curvature in degrees, or null if not enough data
+export const computeSemanticCurvature = (embeddingHistory: number[][]): SignalVote => {
+    if (embeddingHistory.length < 3) return 'UNCERTAIN';
+
+    const n = embeddingHistory.length;
+    const e0 = embeddingHistory[n - 3];
+    const e1 = embeddingHistory[n - 2];
+    const e2 = embeddingHistory[n - 1];
+
+    // velocity vectors
+    const v1 = e1.map((val, i) => val - e0[i]);
+    const v2 = e2.map((val, i) => val - e1[i]);
+    const m1 = magnitude(v1);
+    const m2 = magnitude(v2);
+
+    if (m1 === 0 || m2 === 0) return 'UNCERTAIN';
+
+    const cosAngle = Math.max(-1, Math.min(1, dotProduct(v1, v2) / (m1 * m2)));
+    const curvatureDeg = (Math.acos(cosAngle) * 180) / Math.PI;
+    const sim = cosineSim(e1, e2);
+
+    const vote: SignalVote = (curvatureDeg < 20 && sim > 0.70) ? 'SAME'
+        : curvatureDeg > 45 ? 'NEW'
+        : 'UNCERTAIN';
+
+    console.log(`[CurveTile] Curvature: κ=${curvatureDeg.toFixed(1)}° sim=${sim.toFixed(3)} → ${vote}`);
+    return vote;
+};
+
+// --- VOTING ORCHESTRATOR ---
+// Filters UNCERTAIN votes, requires 2/3 majority for a decision
+// Discourse hint breaks ties
+export const multiSignalVote = (
+    ncd: SignalVote,
+    jaccard: SignalVote,
+    curvature: SignalVote,
+    discourseHint: HeuristicHint = 'UNCERTAIN'
+): SignalVote => {
+    const definitive = [ncd, jaccard, curvature].filter(v => v !== 'UNCERTAIN');
+    const newCount = definitive.filter(v => v === 'NEW').length;
+    const sameCount = definitive.filter(v => v === 'SAME').length;
+
+    let vote: SignalVote;
+
+    if (definitive.length === 0) {
+        // All signals uncertain — fall back to discourse hint
+        vote = discourseHint === 'LIKELY_NEW' ? 'NEW'
+            : discourseHint === 'LIKELY_SAME' ? 'SAME'
+            : 'UNCERTAIN';
+    } else if (newCount / definitive.length >= 0.67) {
+        vote = 'NEW';
+    } else if (sameCount / definitive.length >= 0.67) {
+        vote = 'SAME';
+    } else {
+        // Exactly split — discourse hint breaks tie
+        vote = discourseHint === 'LIKELY_NEW' ? 'NEW'
+            : discourseHint === 'LIKELY_SAME' ? 'SAME'
+            : 'UNCERTAIN';
+    }
+
+    console.log(`[CurveTile] Vote: ncd=${ncd} jaccard=${jaccard} curvature=${curvature} discourse=${discourseHint} → ${vote}`);
+    return vote;
+};
+
+// --- FULL PIPELINE (convenience for console testing) ---
+// Usage: await window.__curveTile.runPipeline(contextMessages, newMessage, currentTopic)
+export const runCurveTilePipeline = async (
+    contextMessages: string[],
+    newMessage: string,
+    currentTopic: string = 'unknown'
+): Promise<{ ncd: SignalVote; jaccard: SignalVote; curvature: SignalVote; vote: SignalVote }> => {
+    // Include topic title prominently — helps NCD see sub-topics as related
+    // e.g. "Dinner Party Planning\nlet's plan..." compresses well with "what music?"
+    const contextText = `[Topic: ${currentTopic}]\n` + contextMessages.join('\n');
+    const discourseHint = getHeuristicHint(currentTopic, newMessage);
+
+    const [ncd, jaccard] = await Promise.all([
+        computeNCD(contextText, newMessage),
+        Promise.resolve(computeJaccard([currentTopic, ...contextMessages], newMessage))
+    ]);
+
+    // Curvature needs embedding history — return UNCERTAIN in standalone mode
+    const curvature: SignalVote = 'UNCERTAIN';
+
+    const vote = multiSignalVote(ncd, jaccard, curvature, discourseHint);
+    console.log(`[CurveTile] Pipeline complete for "${newMessage.slice(0, 40)}..." → ${vote}`);
+    return { ncd, jaccard, curvature, vote };
+};
+
+// Expose on window for browser console testing
+if (typeof window !== 'undefined') {
+    (window as any).__curveTile = {
+        computeNCD,
+        computeJaccard,
+        computeSemanticCurvature,
+        multiSignalVote,
+        runPipeline: runCurveTilePipeline,
+    };
+    console.log('[CurveTile] Module loaded. Test with: await window.__curveTile.runPipeline(["context msg 1", "context msg 2"], "new message")');
+}
 
 export const generateInitialTitle = async (
     messages: { role: string; content: string }[],
