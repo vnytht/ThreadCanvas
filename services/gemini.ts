@@ -151,6 +151,8 @@ const streamOllamaResponse = async (history: { role: string; content: string }[]
 const callOllamaAnalysis = async (prompt: string): Promise<string | null> => {
     try {
         const modelName = await getOllamaModel();
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 3000); // 3s timeout — fail fast on Vercel
         const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -158,13 +160,15 @@ const callOllamaAnalysis = async (prompt: string): Promise<string | null> => {
                 model: modelName,
                 messages: [{ role: 'user', content: prompt }],
                 stream: false
-            })
+            }),
+            signal: controller.signal
         });
+        clearTimeout(timeout);
         if (!response.ok) return null;
         const json = await response.json();
         return json.message?.content || null;
     } catch (e) {
-        return null;
+        return null; // timeout or connection refused → Gemini fallback kicks in
     }
 };
 
@@ -330,10 +334,10 @@ const CONTINUATION_SIGNALS = ['also', 'and what about', 'what if', 'how about fo
 
 type HeuristicHint = 'LIKELY_NEW' | 'LIKELY_SAME' | 'UNCERTAIN';
 
-const getHeuristicHint = (currentTopic: string, userMessage: string): HeuristicHint => {
+const getHeuristicHint = (currentTopic: string, userMessage: string, contextMessages?: string[]): HeuristicHint => {
     const msgLower = userMessage.toLowerCase();
 
-    // Check replacement signals — "actually" + context suggests a change of mind
+    // Check replacement signals — "actually", "instead", etc. = change of mind
     if (REPLACEMENT_SIGNALS.some(signal => msgLower.includes(signal))) {
         return 'LIKELY_NEW';
     }
@@ -343,16 +347,19 @@ const getHeuristicHint = (currentTopic: string, userMessage: string): HeuristicH
         return 'LIKELY_SAME';
     }
 
-    // Keyword divergence: does the message share ANY content words with the topic?
+    // Keyword divergence: check against BOTH the chapter title AND recent message content
+    // This prevents "what drink goes with pasta?" being flagged as NEW just because
+    // "drink" and "pasta" don't appear in "Dinner Party Planning"
+    const allContext = [currentTopic, ...(contextMessages || [])].join(' ');
     const topicWords = new Set(
-        currentTopic.toLowerCase().split(/\s+/).filter(w => w.length > 3)
+        allContext.toLowerCase().split(/\s+/).filter(w => w.length > 3)
     );
     const msgWords = msgLower.split(/\s+/).filter(w => w.length > 3);
     const hasOverlap = msgWords.some(w => topicWords.has(w));
 
     const isQuestion = msgLower.includes('?') || /^(what|who|how|where|when|why|can|do|does|is|are)\b/.test(msgLower);
 
-    // Zero overlap + question + enough words → likely a different domain
+    // Only flag LIKELY_NEW if ZERO overlap with ALL recent context (not just title)
     if (!hasOverlap && isQuestion && msgWords.length >= 2) {
         return 'LIKELY_NEW';
     }
@@ -391,11 +398,15 @@ Examples:
 - Topic: "Dinner Party Planning", Message: "what about outdoor seating?" → SAME
 - Topic: "Dinner Party Planning", Message: "what if guests are vegan?" → SAME
 - Topic: "Dinner Party Planning", Message: "what music should I play?" → SAME
+- Topic: "Dinner Party Planning", Message: "what drink goes with pasta?" → SAME
+- Topic: "Dinner Party Planning", Message: "what wine pairs well with this?" → SAME
 - Topic: "Dinner Party Planning", Message: "actually, let's do Japanese instead" → NEW
 - Topic: "Dinner Party Planning", Message: "what's the capital of India?" → NEW
+- Topic: "Italian Dinner Theme", Message: "what dessert should I serve?" → SAME
+- Topic: "Italian Dinner Theme", Message: "what wine goes with pasta?" → SAME
+- Topic: "Italian Dinner Theme", Message: "help me write a resume" → NEW
 - Topic: "Python Debugging", Message: "can you fix the loop too?" → SAME
 - Topic: "Python Debugging", Message: "help me plan my vacation" → NEW
-- Topic: "Italian Recipes", Message: "actually switch to French cooking" → NEW
 - Topic: "Travel Planning", Message: "what about hotels?" → SAME
 
 Topic: "${currentTopic}", Message: "${lastUserMessage.slice(0, 200)}" →`;
@@ -481,8 +492,10 @@ export const analyzeTopicShift = async (
 
     if (!lastUserMessage) return 'SAME';
 
-    // Layer 2: Heuristic pre-filter
-    const hint = getHeuristicHint(currentTopic, lastUserMessage);
+    // Layer 2: Heuristic pre-filter — pass recent message content so "wine/pasta/drink"
+    // correctly overlap with previous dinner conversation messages (not just the chapter title)
+    const contextContents = newMessages.map(m => m.content);
+    const hint = getHeuristicHint(currentTopic, lastUserMessage, contextContents);
 
     // Layer 3, Step 1: Binary classification (SAME or NEW)
     const classification = await classifyTopicShift(currentTopic, lastUserMessage, hint, preferredBackend);

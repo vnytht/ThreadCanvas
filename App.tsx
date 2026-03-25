@@ -224,6 +224,14 @@ const App = () => {
               // unrelated chapter from a previous thread.
               const baselineTopic = currentChapter?.title ?? null;
 
+              // Pre-check: if the first buffered message already has a chapter, skip API call entirely
+              const firstBufMsg = bufferMessages[0];
+              if (firstBufMsg && chapters.find(c => c.startMessageId === firstBufMsg.id)) {
+                  // Message already owned by a branch chapter — just advance the cursor
+                  lastAnalyzedIndexRef.current = totalCount;
+                  return;
+              }
+
               if (isAnalyzingRef.current) return;
               isAnalyzingRef.current = true;
 
@@ -414,10 +422,9 @@ const App = () => {
         };
         setChapters(prev => [...prev, newBranchChapter]);
 
-        const parentMsg = messages.find(m => m.id === activeBranchHeadId);
-        const titleContext = parentMsg
-            ? [{ role: 'model', content: parentMsg.content.slice(0, 300) }, { role: 'user', content }]
-            : [{ role: 'user', content }];
+        // Use only the branch message itself for the title — including parent content
+        // causes the parent's topic to bleed into the branch title (e.g. "Italian Dinner Music" for a BBQ branch)
+        const titleContext = [{ role: 'user', content }];
         generateInitialTitle(titleContext, preferredBackend).then(aiTitle => {
             if (aiTitle) {
                 setChapters(prev => prev.map(c => c.id === branchChapterId ? { ...c, title: aiTitle } : c));
