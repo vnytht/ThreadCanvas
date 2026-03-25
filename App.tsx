@@ -235,6 +235,17 @@ const App = () => {
                       const alreadyOwned = prev.find(c => c.startMessageId === startMsg.id);
                       if (alreadyOwned) return prev;
 
+                      // Dedup: if the last chapter in this thread has the same title, extend it instead of creating a duplicate
+                      const lastThreadChap = [...prev].reverse().find(c => threadIds.has(c.startMessageId));
+                      if (lastThreadChap && result !== 'SAME' && lastThreadChap.title.toLowerCase() === result.toLowerCase()) {
+                          const updatedChapters = [...prev];
+                          const idx = updatedChapters.findIndex(c => c.id === lastThreadChap.id);
+                          if (idx !== -1) {
+                              updatedChapters[idx] = { ...updatedChapters[idx], messageCount: updatedChapters[idx].messageCount + newMessagesCount };
+                          }
+                          return updatedChapters;
+                      }
+
                       if (result === "SAME" && prev.length > 0) {
                           const updatedChapters = [...prev];
                           let lastThreadChapIndex = -1;

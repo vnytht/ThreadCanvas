@@ -722,9 +722,10 @@ export const generateInitialTitle = async (
 ): Promise<string> => {
     const text = messages.map(m => m.content).join('\n').slice(0, 500);
     const prompt = `2-4 word title for this conversation. Title Case. Nothing else — no quotes, no punctuation, no explanation, no preamble.
-FORBIDDEN: "New Topic", "Topic Change", titles ending in "Topic", any sentence or commentary.
-GOOD: Dinner Party Planning | Japanese Theme Ideas | Capital of India | Wine Recommendations
-BAD: New Topic | Language Query Topic | A new chapter! Output: ...
+Simple and descriptive — NOT poetic, creative, or metaphorical. Use plain English words that describe what the conversation is literally about.
+FORBIDDEN: "New Topic", "Topic Change", titles ending in "Topic", any sentence or commentary, poetic/Japanese/foreign words.
+GOOD: Dinner Party Planning | Japanese Dinner Theme | Capital of India | Wine Recommendations | Python Debugging
+BAD: New Topic | Sakura Soiree | Culinary Journey | Eastern Delights | Language Query Topic
 Text: ${text}`;
 
     const tryGemini = async () => await executeGeminiAnalysis(prompt);
