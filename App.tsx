@@ -9,7 +9,7 @@ import { MessageBubble } from './components/MessageBubble';
 import { Button } from './components/Button';
 import { CanvasView } from './components/CanvasView';
 import { ContextPanel } from './components/ContextPanel';
-import { streamResponse, analyzeTopicShift, generateInitialTitle, BackendType, AVAILABLE_GEMINI_MODELS } from './services/gemini';
+import { streamResponse, analyzeTopicShift, generateInitialTitle, validateAndCleanTitle, BackendType, AVAILABLE_GEMINI_MODELS, REPLACEMENT_SIGNALS } from './services/gemini';
 import { OllamaGuide } from './components/OllamaGuide';
 
 const App = () => {
@@ -46,6 +46,9 @@ const App = () => {
   const observerRef = useRef<IntersectionObserver | null>(null);
   const linearViewRef = useRef<HTMLDivElement>(null);
   const isAnalyzingRef = useRef(false);
+  // Set to true when inline topic detection (stream interceptor) handles a batch —
+  // prevents the auto-summarizer useEffect from double-analyzing the same messages.
+  const inlineTopicHandledRef = useRef(false);
 
   const isNewChat = activeBranchHeadId === ROOT_MESSAGE.id && !isDraftingBranch;
 
@@ -159,7 +162,14 @@ const App = () => {
           const totalCount = validMessages.length;
           
           if (lastAnalyzedIndexRef.current > totalCount) {
-             lastAnalyzedIndexRef.current = Math.max(0, totalCount - 1); 
+             lastAnalyzedIndexRef.current = Math.max(0, totalCount - 1);
+          }
+
+          // Inline topic detection (stream interceptor) already handled this batch — skip
+          if (inlineTopicHandledRef.current) {
+              inlineTopicHandledRef.current = false;
+              lastAnalyzedIndexRef.current = totalCount;
+              return;
           }
 
           const newMessagesCount = totalCount - lastAnalyzedIndexRef.current;
@@ -452,18 +462,98 @@ const App = () => {
     setMessages(prev => [...prev, responsePlaceholder]);
     setActiveBranchHeadId(responseId);
 
+    // --- Inline topic detection setup ---
+    // Build thread ID set (pre-update snapshot + new user message)
+    const threadIdsForInline = new Set([
+        ...currentThread
+            .filter(m => m.id !== 'ghost-draft' && !m.isComposedContext)
+            .map(m => m.id),
+        newMsgId
+    ]);
+    // Find the current topic from the thread's last chapter
+    let currentTopicForStream: string | null | undefined = undefined;
+    const msgWordCount = content.trim().split(/\s+/).length;
+    const hasReplacementSignal = REPLACEMENT_SIGNALS.some(s => content.toLowerCase().includes(s));
+    const shouldInlineDetect = msgWordCount >= 4 && !isBranching && !hasReplacementSignal;
+    if (shouldInlineDetect) {
+        currentTopicForStream = null; // default: first message (no existing topic)
+        for (let i = chapters.length - 1; i >= 0; i--) {
+            if (threadIdsForInline.has(chapters[i].startMessageId)) {
+                currentTopicForStream = chapters[i].title;
+                break;
+            }
+        }
+    }
+
     let fullResponse = '';
     await streamResponse(
-        history, 
+        history,
         (chunk) => {
             fullResponse += chunk;
-            setMessages(prev => prev.map(m => 
+            setMessages(prev => prev.map(m =>
                 m.id === responseId ? { ...m, content: fullResponse } : m
             ));
         },
         (type) => setBackendType(type),
         preferredBackend,
-        selectedModelId 
+        selectedModelId,
+        currentTopicForStream,  // undefined = no inline detection (short msg / branch)
+        shouldInlineDetect ? (topicResult: string) => {
+            if (topicResult === '__FALLBACK__') return; // auto-summarizer will handle it
+            // SAME with no prior topic means the model is confused — fall back to auto-summarizer
+            if (topicResult === 'SAME' && currentTopicForStream === null) return;
+            inlineTopicHandledRef.current = true;
+            console.log(`[InlineTopic] "${content.slice(0, 40)}" → ${topicResult}`);
+
+            setChapters(prev => {
+                // Don't double-create if already owned (e.g. branch chapter)
+                const alreadyOwned = prev.find(c => c.startMessageId === newMsgId);
+                if (alreadyOwned) return prev;
+
+                // Find last chapter belonging to this thread
+                let lastThreadChapIdx = -1;
+                for (let i = prev.length - 1; i >= 0; i--) {
+                    if (threadIdsForInline.has(prev[i].startMessageId)) {
+                        lastThreadChapIdx = i;
+                        break;
+                    }
+                }
+
+                if (topicResult === 'SAME') {
+                    if (lastThreadChapIdx === -1) return prev; // no chapter to extend yet
+                    const updated = [...prev];
+                    const lastChap = updated[lastThreadChapIdx];
+                    const newSub = content.length > 1 ? [content.length > 55 ? content.slice(0, 55).trim() + '...' : content] : [];
+                    updated[lastThreadChapIdx] = {
+                        ...lastChap,
+                        messageCount: lastChap.messageCount + 1,
+                        subtopics: Array.from(new Set([...lastChap.subtopics, ...newSub])).slice(0, 12),
+                        confidence: lastChap.confidence === 'user-edited' ? 'user-edited' : 'auto-confirmed'
+                    };
+                    return updated;
+                }
+
+                // NEW topic — clean and validate the inline title
+                const cleanTitle = validateAndCleanTitle(topicResult) || topicResult;
+
+                // Dedup: same title as last chapter? Extend instead of duplicating
+                if (lastThreadChapIdx !== -1 && prev[lastThreadChapIdx].title.toLowerCase() === cleanTitle.toLowerCase()) {
+                    const updated = [...prev];
+                    updated[lastThreadChapIdx] = { ...updated[lastThreadChapIdx], messageCount: updated[lastThreadChapIdx].messageCount + 1 };
+                    return updated;
+                }
+
+                return [...prev, {
+                    id: `chap-${Date.now()}`,
+                    title: cleanTitle,
+                    category: determineCategory(cleanTitle),
+                    startMessageId: newMsgId,
+                    messageCount: 1,
+                    subtopics: [content.length > 55 ? content.slice(0, 55).trim() + '...' : content],
+                    confidence: 'auto-fragment' as const
+                }];
+            });
+        } : undefined
     );
     setIsStreaming(false);
   };

@@ -91,15 +91,32 @@ const getOllamaModel = async (): Promise<string> => {
     }
 };
 
-const streamOllamaResponse = async (history: { role: string; content: string }[], onChunk: (text: string) => void) => {
+const streamOllamaResponse = async (
+    history: { role: string; content: string }[],
+    onChunk: (text: string) => void,
+    currentTopic?: string | null,
+    onTopicDetected?: (result: string) => void
+) => {
     const modelName = await getOllamaModel();
     console.log(`[Ollama] Using model: ${modelName}`);
 
     // Convert 'user'/'model' to Ollama's 'user'/'assistant'
-    const messages = history.map(msg => ({
+    const messages: { role: string; content: string }[] = history.map(msg => ({
         role: msg.role === 'model' ? 'assistant' : msg.role,
         content: msg.content
     }));
+
+    // Prepend system message for inline topic tracking when requested
+    if (currentTopic !== undefined) {
+        messages.unshift({
+            role: 'system',
+            content: `TOPIC TRACKING: Your response MUST start with exactly one TOPIC tag on its own line:\n- Same topic → TOPIC:[SAME]\n- New topic → TOPIC:[NEW:Short Title Here] (e.g. TOPIC:[NEW:Wine Pairing])\nThen a blank line. Then your actual response. Never skip or explain the tag.\nCurrent topic: "${currentTopic ?? 'None'}"`
+        });
+    }
+
+    const activeChunk = onTopicDetected
+        ? createTopicInterceptor(onTopicDetected, onChunk)
+        : onChunk;
 
     try {
         const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
@@ -122,19 +139,19 @@ const streamOllamaResponse = async (history: { role: string; content: string }[]
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            
+
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split('\n');
-            
+
             // Process all complete lines
-            buffer = lines.pop() || ''; 
-            
+            buffer = lines.pop() || '';
+
             for (const line of lines) {
                 if (!line.trim()) continue;
                 try {
                     const json = JSON.parse(line);
                     if (json.message?.content) {
-                        onChunk(json.message.content);
+                        activeChunk(json.message.content);
                     }
                     if (json.done) return;
                 } catch (e) {
@@ -174,12 +191,65 @@ const callOllamaAnalysis = async (prompt: string, timeoutMs = 3000): Promise<str
     }
 };
 
+// --- INLINE TOPIC DETECTION: Stream Interceptor ---
+// Buffers the first line of every response, parses the TOPIC tag, strips it
+// before it reaches the UI, and fires onTopicDetected with the result.
+// Falls back to '__FALLBACK__' if the model doesn't follow the format.
+const TOPIC_BUFFER_LIMIT = 200; // chars — give up if no newline by this point
+
+const createTopicInterceptor = (
+    onTopicDetected: (result: string) => void,
+    onChunk: (text: string) => void
+): ((chunk: string) => void) => {
+    let buffer = '';
+    let parsed = false;
+
+    return (chunk: string) => {
+        if (parsed) { onChunk(chunk); return; }
+
+        buffer += chunk;
+        const nlIdx = buffer.indexOf('\n');
+
+        if (nlIdx !== -1) {
+            parsed = true;
+            const firstLine = buffer.slice(0, nlIdx).trim();
+            let rest = buffer.slice(nlIdx + 1);
+
+            // Flexible: allow spaces like "TOPIC: [NEW: Title]" or "TOPIC:[SAME]"
+            const match = firstLine.match(/^TOPIC:\s*\[\s*(SAME|NEW:\s*(.+?))\s*\]$/i);
+            if (match) {
+                const isSame = match[1].toUpperCase().startsWith('SAME');
+                const result = isSame ? 'SAME' : (match[2] || '').trim();
+                onTopicDetected(result);
+                // Strip the blank line that follows the tag (if present)
+                if (rest.startsWith('\n')) rest = rest.slice(1);
+                if (rest) onChunk(rest);
+            } else {
+                // Model didn't follow format — emit full buffer, trigger fallback
+                onTopicDetected('__FALLBACK__');
+                onChunk(buffer);
+            }
+        } else if (buffer.length > TOPIC_BUFFER_LIMIT) {
+            // No newline after 200 chars — model skipped the tag entirely
+            parsed = true;
+            onTopicDetected('__FALLBACK__');
+            onChunk(buffer);
+        }
+        // Otherwise: keep buffering, waiting for the first '\n'
+    };
+};
+
 // --- GEMINI INTEGRATION ---
 
+const TOPIC_SYSTEM_SUFFIX = (topic: string | null) =>
+    `\n\nTOPIC TRACKING: Your response MUST start with exactly one TOPIC tag on its own line:\n- Same topic → TOPIC:[SAME]\n- New topic → TOPIC:[NEW:Short Title Here] (e.g. TOPIC:[NEW:Wine Pairing])\nThen a blank line. Then your actual response. Never skip or explain the tag.\nCurrent topic: "${topic ?? 'None'}"`;
+
 const executeGeminiStream = async (
-    history: { role: string; content: string }[], 
+    history: { role: string; content: string }[],
     onChunk: (text: string) => void,
-    modelIdOverride?: string
+    modelIdOverride?: string,
+    currentTopic?: string | null,
+    onTopicDetected?: (result: string) => void
 ): Promise<boolean> => {
     if (!apiKey || isGlobalRateLimited) return false;
 
@@ -189,11 +259,20 @@ const executeGeminiStream = async (
       parts: [{ text: msg.content }]
     }));
 
+    const baseInstruction = "You are a helpful AI assistant. You are concise, thoughtful, and professional. Use markdown for formatting.";
+    const systemInstruction = currentTopic !== undefined
+        ? baseInstruction + TOPIC_SYSTEM_SUFFIX(currentTopic)
+        : baseInstruction;
+
+    const activeChunk = onTopicDetected
+        ? createTopicInterceptor(onTopicDetected, onChunk)
+        : onChunk;
+
     // Prioritize cheaper models by default, or use override
     let modelsToTry = ['gemini-flash-lite-latest', 'gemini-2.5-flash', 'gemini-3-pro-preview'];
-    
+
     if (modelIdOverride) {
-        // If user selected a model, put it first. 
+        // If user selected a model, put it first.
         // We still keep others as fallback in case of rate limits on the specific model
         modelsToTry = [modelIdOverride, ...modelsToTry.filter(id => id !== modelIdOverride)];
     }
@@ -203,15 +282,13 @@ const executeGeminiStream = async (
           const chat = ai.chats.create({
               model: model,
               history: prevHistory,
-              config: {
-                  systemInstruction: "You are a helpful AI assistant. You are concise, thoughtful, and professional. Use markdown for formatting.",
-              }
+              config: { systemInstruction }
           });
 
           const result = await chat.sendMessageStream({ message: lastMsg.content });
-          
+
           for await (const chunk of result) {
-              if (chunk.text) onChunk(chunk.text);
+              if (chunk.text) activeChunk(chunk.text);
           }
           return true; // Success
 
@@ -265,19 +342,21 @@ export const streamResponse = async (
   onChunk: (text: string) => void,
   onBackendChange?: (type: BackendType) => void,
   preferredBackend: 'GEMINI' | 'OLLAMA' = 'GEMINI',
-  specificModelId?: string
+  specificModelId?: string,
+  currentTopic?: string | null,          // undefined = skip inline detection; null = first message
+  onTopicDetected?: (result: string) => void  // 'SAME' | title string | '__FALLBACK__'
 ) => {
-  
+
   // Determine Execution Order based on preference
   const tryGemini = async () => {
-      const success = await executeGeminiStream(history, onChunk, specificModelId);
+      const success = await executeGeminiStream(history, onChunk, specificModelId, currentTopic, onTopicDetected);
       if (success) onBackendChange?.('GEMINI');
       return success;
   };
 
   const tryOllama = async () => {
       try {
-          await streamOllamaResponse(history, onChunk);
+          await streamOllamaResponse(history, onChunk, currentTopic, onTopicDetected);
           onBackendChange?.('OLLAMA');
           return true;
       } catch (e) {
@@ -300,9 +379,9 @@ export const streamResponse = async (
 // --- TITLE VALIDATION ---
 // Rejects model outputs that are sentences instead of titles (common failure mode on smaller models)
 const SENTENCE_STARTERS = ['since ', 'the user', 'based on', 'it ', 'this ', 'when ', 'as the', 'given ', 'because ', 'therefore ', 'after ', 'following ', 'note:', 'output:', 'title:', 'a new ', 'here ', 'okay', 'sure', 'i '];
-const GENERIC_TITLES = new Set(['new topic', 'topic change', 'different subject', 'new subject', 'general discussion', 'untitled', 'conversation', 'language query', 'new chapter', 'topic shift', 'subject change']);
+const GENERIC_TITLES = new Set(['new topic', 'topic change', 'different subject', 'new subject', 'general discussion', 'untitled', 'conversation', 'language query', 'new chapter', 'topic shift', 'subject change', 'short title here', '2-4 word title in title case']);
 
-const validateAndCleanTitle = (raw: string): string | null => {
+export const validateAndCleanTitle = (raw: string): string | null => {
     let clean = raw.trim().replace(/^"|"$/g, '').replace(/\.$/, '').trim();
     if (!clean) return null;
     if (clean.toLowerCase() === 'same') return 'SAME';
@@ -322,6 +401,11 @@ const validateAndCleanTitle = (raw: string): string | null => {
     // Reject anything with exclamation marks or asterisks — it's commentary, not a title
     if (clean.includes('!') || clean.includes('*')) return null;
 
+    // Normalize ALL-CAPS titles to Title Case (e.g. "JAPANESE DINNER PARTY" → "Japanese Dinner Party")
+    if (clean === clean.toUpperCase() && clean.length > 2) {
+        clean = clean.toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+    }
+
     const words = clean.split(/\s+/);
     if (words.length > 8) return null; // it's a sentence, not a title
     const lower = clean.toLowerCase();
@@ -331,7 +415,7 @@ const validateAndCleanTitle = (raw: string): string | null => {
 };
 
 // --- LAYER 2: HEURISTIC PRE-FILTER ---
-const REPLACEMENT_SIGNALS = ['actually', 'instead', 'switch to', 'change to', 'scratch that', 'forget that', 'never mind', 'on second thought', 'rather than', 'let\'s do', 'how about we do'];
+export const REPLACEMENT_SIGNALS = ['actually', 'instead', 'switch to', 'change to', 'scratch that', 'forget that', 'never mind', 'on second thought', 'rather than', 'let\'s do', 'how about we do'];
 const CONTINUATION_SIGNALS = ['also', 'and what about', 'what if', 'how about for', 'another thing', 'one more', 'additionally', 'plus', 'regarding', 'about the', 'for the', 'back to', 'what about'];
 
 type HeuristicHint = 'LIKELY_NEW' | 'LIKELY_SAME' | 'UNCERTAIN';
